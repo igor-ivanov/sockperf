@@ -103,7 +103,32 @@
 
 #ifndef __windows__
 #include <dlfcn.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <cmath>
 #endif
+
+#define SOCKPERF_MEM_ALLOC_MALLOC                1
+#define SOCKPERF_MEM_ALLOC_CALLOC                2
+#define SOCKPERF_MEM_ALLOC_MMAP                  3
+#define SOCKPERF_MEM_ALLOC_FLAGS_BOTH            1
+#define SOCKPERF_MEM_ALLOC_FLAGS_TX              2
+#define SOCKPERF_MEM_ALLOC_FLAGS_RX              3
+#define SOCKPERF_MEM_ALLOC_FLAGS_NONE            4
+#define SOCKPERF_MEM_ALLOC_WRONG_SIZE_DISABLE    0
+#define SOCKPERF_MEM_ALLOC_WRONG_SIZE_ENABLE     1
+#define SOCKPERF_MEM_ALLOC_MMAP_SHARED_DISABLE   0
+#define SOCKPERF_MEM_ALLOC_MMAP_SHARED_ENABLE    1
+#define MMAP_COMMON_FLAGS                        (PROT_READ | PROT_WRITE)
+#define MMAP_COMMON_PROT                         (MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE | MAP_HUGETLB)
+#define IOCTL_USER_SIZE                          100
+
+int ioctl_mem_size = 0;
+size_t memory_size = 0;
 
 // forward declarations from Client.cpp & Server.cpp
 extern void client_sig_handler(int signum);
@@ -3515,48 +3540,159 @@ static int set_sockets_from_feedfile(const char *feedfile_name) {
 /* It is special code block to verify
  * RM# 4251780
  */
-void *test_malloc(size_t size) {
-    void *ptr = malloc(size);
-    log_msg("Allocated memory: ptr=%p size=%ld", ptr, size);
+
+size_t ioctl_align_size(size_t original_size) { 
+    size_t hugepage_size = 0;
+    FILE *file           = fopen("/proc/meminfo", "r");
+    char line[256];
+    size_t aligned_size;
+
+    if (!file) {
+        perror("Error opening /proc/meminfo");
+        return 0;
+    }
+    
+    while (fgets(line, sizeof(line), file)) {
+        if (strstr(line, "Hugepagesize") != NULL) {
+            sscanf(line, "Hugepagesize: %zu kB", &hugepage_size);
+            hugepage_size *= 1024;  // Convert to bytes
+            break;
+       }
+    }
+    
+    fclose(file);
+    
+    if (hugepage_size == 0) {
+        fprintf(stderr, "Hugepagesize not found!\n");
+        return 0;
+    }
+
+    aligned_size = ceil((double)original_size / hugepage_size) * hugepage_size;
+    return aligned_size;
+}
+
+void *test_alloc(size_t size) {
+    uint8_t ioctl_alloc_func         = SOCKPERF_MEM_ALLOC_MALLOC;
+    uint8_t ioctl_alloc_mmap_shared  = SOCKPERF_MEM_ALLOC_MMAP_SHARED_DISABLE;
+    void *ptr;
+    void *user_mem_ptr;
+    char *env_ptr;
+    int i;
+
+    if((env_ptr = getenv("IOCTL_ALLOC_FUNC")) != NULL) {
+	ioctl_alloc_func = (uint8_t)atoi(env_ptr);
+    }
+
+    if (ioctl_alloc_func == SOCKPERF_MEM_ALLOC_CALLOC) {
+        ptr = calloc(1,size + IOCTL_USER_SIZE);
+        user_mem_ptr = (void *)((uint8_t *)ptr + size);
+        for (i = 0; i < IOCTL_USER_SIZE; i++) {
+	    (*((unsigned char *)user_mem_ptr + i)) = (unsigned char)i;
+        }
+        log_msg("Allocated memory: Allocated by CALLOC, ptr=%p size=%ld", ptr, size + IOCTL_USER_SIZE);
+    } else if (ioctl_alloc_func == SOCKPERF_MEM_ALLOC_MMAP) {
+        if((env_ptr = getenv("IOCTL_ALLOC_MMAP_SHARED")) != NULL) {
+	    ioctl_alloc_mmap_shared = (uint8_t)atoi(env_ptr);
+        }
+
+	memory_size = ioctl_align_size(size);
+
+	if (ioctl_alloc_mmap_shared == SOCKPERF_MEM_ALLOC_MMAP_SHARED_ENABLE) {
+            ptr = mmap(NULL, memory_size, MMAP_COMMON_FLAGS, MMAP_COMMON_PROT | MAP_SHARED, -1, 0);
+	} else {
+            ptr = mmap(NULL, memory_size, MMAP_COMMON_FLAGS, MMAP_COMMON_PROT, -1, 0);
+	}
+        log_msg("Allocated memory: Allocated by MMAP, ptr=%p size=%ld", ptr, memory_size);
+    } else {
+        ptr = malloc(size);
+        log_msg("Allocated memory: Allocated by MALLOC, ptr=%p size=%ld", ptr, size);
+    }
+    ioctl_mem_size = size;
+
     return ptr;
 }
 
-void test_free(void *ptr) {
-    free(ptr);
+void test_release(void *ptr) {
+    uint8_t ioctl_alloc_func = SOCKPERF_MEM_ALLOC_MALLOC;
+    char *env_ptr;
+    void *user_mem_ptr;
+    int i;
+
+    if((env_ptr = getenv("IOCTL_ALLOC_FUNC")) != NULL) {
+	ioctl_alloc_func = (uint8_t)atoi(env_ptr);
+    }
+    
+    user_mem_ptr = (void *)((uint8_t *)ptr + ioctl_mem_size);
+    if (ioctl_alloc_func == SOCKPERF_MEM_ALLOC_CALLOC) {
+        for (i = 0; i < IOCTL_USER_SIZE; i++) {
+	    if ((*((unsigned char *)user_mem_ptr + i)) != (unsigned char)i) {
+                log_msg("IOCTL ERROR: User Memory Value is Wrong. Expected value: %d, Actual Value: %d", i, *((unsigned char *)user_mem_ptr + i));
+	    }
+        }
+    }
+
+    if (ioctl_alloc_func == SOCKPERF_MEM_ALLOC_MMAP) {
+        munmap(ptr, memory_size);
+    } else {
+        free(ptr);
+    }
     log_msg("Freed memory: ptr=%p", ptr);
 }
 
 void test_init(void)
 {
+    char *env_ptr;
+    int rc                    = 0;
+    uint8_t ioctl_wrong_size  = SOCKPERF_MEM_ALLOC_WRONG_SIZE_DISABLE;
+    uint8_t ioctl_flags       = SOCKPERF_MEM_ALLOC_FLAGS_NONE;
+    vma_cmsg_ioctl_user_alloc_t data;
+    struct cmsghdr *cmsg;
+    char cbuf[CMSG_SPACE(sizeof(data))];
+
     if (!g_vma_api || !(g_vma_api->vma_extra_supported_mask & VMA_EXTRA_API_IOCTL)) {
         errno = EOPNOTSUPP;
         exit_with_err("VMA Extra API does not support VMA_EXTRA_API_IOCTL", SOCKPERF_ERR_FATAL);
     }
 
-    int rc = 0;
-	vma_cmsg_ioctl_user_alloc_t data;
-	struct cmsghdr *cmsg;
-	char cbuf[CMSG_SPACE(sizeof(data))];
+    if((env_ptr = getenv("IOCTL_WRONG_SIZE")) != NULL) {
+	ioctl_wrong_size = (uint8_t)atoi(env_ptr);
+    }
 
-	cmsg = (struct cmsghdr *)cbuf;
-	cmsg->cmsg_level = SOL_SOCKET;
-	cmsg->cmsg_type = CMSG_VMA_IOCTL_USER_ALLOC;
-	cmsg->cmsg_len = CMSG_LEN(sizeof(data));
-	data.flags = VMA_IOCTL_USER_ALLOC_FLAG_TX | VMA_IOCTL_USER_ALLOC_FLAG_RX;
-	data.memalloc = test_malloc;
-	data.memfree = test_free;
-	memcpy(CMSG_DATA(cmsg), &data, sizeof(data));
+    if((env_ptr = getenv("IOCTL_FLAGS")) != NULL) {
+	ioctl_flags = (uint8_t)atoi(env_ptr);
+    }
+
+    cmsg = (struct cmsghdr *)cbuf;
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = CMSG_VMA_IOCTL_USER_ALLOC;
+    if (ioctl_wrong_size == SOCKPERF_MEM_ALLOC_WRONG_SIZE_ENABLE) {
+        cmsg->cmsg_len = CMSG_LEN(sizeof(data)) - 1;
+    } else {
+        cmsg->cmsg_len = CMSG_LEN(sizeof(data));
+    }
+    if (ioctl_flags == SOCKPERF_MEM_ALLOC_FLAGS_TX) {
+        data.flags = VMA_IOCTL_USER_ALLOC_FLAG_TX;
+    } else if (ioctl_flags == SOCKPERF_MEM_ALLOC_FLAGS_RX) {
+        data.flags = VMA_IOCTL_USER_ALLOC_FLAG_RX;
+    } else {
+        data.flags = VMA_IOCTL_USER_ALLOC_FLAG_TX | VMA_IOCTL_USER_ALLOC_FLAG_RX;
+    }
+    data.memalloc = test_alloc;
+    data.memfree = test_release;
+    memcpy(CMSG_DATA(cmsg), &data, sizeof(data));
 
 #ifndef VMA_XLIO_NO_FUNCTIONS_DEFINES
 #undef ioctl
-	rc = g_vma_api->ioctl(cmsg, cmsg->cmsg_len);
-    #define ioctl(...) fn_ioctl(__VA_ARGS__)
-#else
-	rc = g_vma_api->ioctl(cmsg, cmsg->cmsg_len);
 #endif
-	if (rc < 0) {
-        exit_with_err("VMA Extra API ioctl() failure.", SOCKPERF_ERR_FATAL);
+    if (ioctl_flags != SOCKPERF_MEM_ALLOC_FLAGS_NONE) {
+        rc = g_vma_api->ioctl(cmsg, cmsg->cmsg_len);
+        if (rc < 0) {
+            exit_with_err("VMA Extra API ioctl() failure.", SOCKPERF_ERR_FATAL);
+        }
     }
+#ifndef VMA_XLIO_NO_FUNCTIONS_DEFINES
+    #define ioctl(...) fn_ioctl(__VA_ARGS__)
+#endif
 }
 #endif // USING_VMA_EXTRA_API
 
